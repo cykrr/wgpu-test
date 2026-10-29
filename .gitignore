@@ -1,0 +1,4 @@
+/target
+ios/.build/
+ios/xtool/
+ios/.bsp/
