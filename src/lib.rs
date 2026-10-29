@@ -40,11 +40,12 @@ struct VertexOutput {
 fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
     var out: VertexOutput;
 
-    // Centered equilateral triangle with circumradius R = 0.5 in the XY plane
+    // Centered equilateral triangle with circumradius R = 0.42 in the XY plane
+    // Sized to ensure perspective projection never clips against screen bounds
     var pos = array<vec3<f32>, 3>(
-        vec3<f32>( 0.0,         0.5,   0.0), // Top
-        vec3<f32>(-0.4330127,  -0.25,  0.0), // Bottom-left
-        vec3<f32>( 0.4330127,  -0.25,  0.0)  // Bottom-right
+        vec3<f32>( 0.0,         0.42,  0.0), // Top
+        vec3<f32>(-0.3637307,  -0.21,  0.0), // Bottom-left
+        vec3<f32>( 0.3637307,  -0.21,  0.0)  // Bottom-right
     );
 
     var colors = array<vec3<f32>, 3>(
@@ -72,14 +73,15 @@ fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
     let y2 = y1;
 
     // 3. Perspective projection
-    // Camera located at d = 2.0 along +Z looking toward origin
-    let d = 2.0;
+    // Camera located at d = 2.5 along +Z looking toward origin
+    let d = 2.5;
     let persp = d / (d - z2);
     let proj_x = x2 * persp;
     let proj_y = y2 * persp;
 
-    // Apply aspect-ratio scale so geometry is 1:1 on both portrait and landscape
-    out.clip_position = vec4<f32>(proj_x * uniforms.scale.x, proj_y * uniforms.scale.y, z2 * 0.5, 1.0);
+    // Place z_clip at 0.5 (safely centered inside Metal/WebGPU [0.0, 1.0] depth volume)
+    // to prevent near/far plane clipping when rotated in 3D
+    out.clip_position = vec4<f32>(proj_x * uniforms.scale.x, proj_y * uniforms.scale.y, 0.5, 1.0);
     out.color = colors[in_vertex_index];
     return out;
 }
