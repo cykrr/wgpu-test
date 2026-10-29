@@ -1,12 +1,29 @@
+//! Cross-platform "Hello World" colored triangle in Rust using `winit` (v0.30+) and `wgpu`.
+//!
+//! Compatible with Windows, Linux, and iOS/macOS.
+
 use std::borrow::Cow;
 use std::sync::Arc;
+use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
 
+/// WGSL shader source code.
+///
+/// Draws an equilateral colored triangle indexed by `@builtin(vertex_index)`.
+/// An aspect-ratio scale uniform is applied to ensure the triangle maintains
+/// correct 1:1 geometry across both vertical (portrait phone) and horizontal (desktop/landscape) screens.
 const SHADER_SOURCE: &str = r#"
+struct Uniforms {
+    scale: vec2<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> uniforms: Uniforms;
+
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) color: vec3<f32>,
@@ -17,18 +34,19 @@ fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
     var out: VertexOutput;
 
     var pos = array<vec2<f32>, 3>(
-        vec2<f32>( 0.0,  0.5),
-        vec2<f32>(-0.5, -0.5),
-        vec2<f32>( 0.5, -0.5)
+        vec2<f32>( 0.0,  0.25), // Top
+        vec2<f32>(-0.5, -0.5), // Bottom-left
+        vec2<f32>( 0.5, -0.5)  // Bottom-right
     );
 
     var colors = array<vec3<f32>, 3>(
-        vec3<f32>(1.0, 0.0, 0.0),
-        vec3<f32>(0.0, 1.0, 0.0),
-        vec3<f32>(0.0, 0.0, 1.0)
+        vec3<f32>(1.0, 0.0, 0.0), // Red
+        vec3<f32>(0.0, 1.0, 0.0), // Green
+        vec3<f32>(0.0, 0.0, 1.0)  // Blue
     );
 
-    out.clip_position = vec4<f32>(pos[in_vertex_index], 0.0, 1.0);
+    // Apply aspect-ratio scale so triangle doesn't stretch or distort
+    out.clip_position = vec4<f32>(pos[in_vertex_index] * uniforms.scale, 0.0, 1.0);
     out.color = colors[in_vertex_index];
     return out;
 }
@@ -39,6 +57,22 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// Calculates 2D scale factors that preserve 1:1 aspect ratio across portrait and landscape screens.
+fn calculate_aspect_scale(width: u32, height: u32) -> [f32; 2] {
+    let w = width.max(1) as f32;
+    let h = height.max(1) as f32;
+    let aspect = w / h;
+    if aspect < 1.0 {
+        // Vertical / Portrait (e.g. mobile phone):
+        // Scale Y by `aspect` so vertical height in pixels matches horizontal width.
+        [1.0, aspect]
+    } else {
+        // Horizontal / Landscape (e.g. desktop monitor):
+        // Scale X by `1.0 / aspect` so horizontal width in pixels matches vertical height.
+        [1.0 / aspect, 1.0]
+    }
+}
+
 pub struct RenderState {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
@@ -46,6 +80,8 @@ pub struct RenderState {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
+    uniform_buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
 }
 
 impl RenderState {
@@ -57,7 +93,7 @@ impl RenderState {
         let instance = wgpu::Instance::default();
         let surface = instance
             .create_surface(window.clone())
-            .expect("Failed to create surface");
+            .expect("Failed to create wgpu surface");
 
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -66,7 +102,7 @@ impl RenderState {
                 force_fallback_adapter: false,
             })
             .await
-            .expect("Failed to find adapter");
+            .expect("Failed to find GPU adapter");
 
         let (device, queue) = adapter
             .request_device(
@@ -79,7 +115,7 @@ impl RenderState {
                 None,
             )
             .await
-            .expect("Failed to create device");
+            .expect("Failed to create logical device");
 
         let surface_caps = surface.get_capabilities(&adapter);
         let surface_format = surface_caps
@@ -101,6 +137,38 @@ impl RenderState {
         };
         surface.configure(&device, &config);
 
+        // Aspect ratio uniform buffer & bind group
+        let scale = calculate_aspect_scale(width, height);
+        let uniform_data: [f32; 4] = [scale[0], scale[1], 0.0, 0.0];
+        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Aspect Ratio Uniform Buffer"),
+            contents: bytemuck::cast_slice(&uniform_data),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Aspect Ratio Bind Group Layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Aspect Ratio Bind Group"),
+            layout: &bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            }],
+        });
+
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Triangle Shader"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(SHADER_SOURCE)),
@@ -108,7 +176,7 @@ impl RenderState {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Triangle Pipeline Layout"),
-            bind_group_layouts: &[],
+            bind_group_layouts: &[&bind_group_layout],
             push_constant_ranges: &[],
         });
 
@@ -157,6 +225,8 @@ impl RenderState {
             queue,
             config,
             pipeline,
+            uniform_buffer,
+            bind_group,
         }
     }
 
@@ -165,10 +235,25 @@ impl RenderState {
             self.config.width = new_size.width;
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
+
+            // Update aspect ratio scale uniform
+            let scale = calculate_aspect_scale(new_size.width, new_size.height);
+            let uniform_data: [f32; 4] = [scale[0], scale[1], 0.0, 0.0];
+            self.queue
+                .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&uniform_data));
         }
     }
 
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        // Guard: dynamically adapt if physical window size changed (e.g. during iOS orientation transition)
+        let current_size = self.window.inner_size();
+        if current_size.width > 0
+            && current_size.height > 0
+            && (current_size.width != self.config.width || current_size.height != self.config.height)
+        {
+            self.resize(current_size);
+        }
+
         let output = self.surface.get_current_texture()?;
         let view = output
             .texture
@@ -202,6 +287,7 @@ impl RenderState {
             });
 
             render_pass.set_pipeline(&self.pipeline);
+            render_pass.set_bind_group(0, &self.bind_group, &[]);
             render_pass.draw(0..3, 0..1);
         }
 
@@ -220,9 +306,29 @@ pub struct App {
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_none() {
-            let window_attributes = Window::default_attributes()
-                .with_title("Hello Triangle (wgpu + winit)")
-                .with_inner_size(winit::dpi::LogicalSize::new(800.0, 600.0));
+            #[allow(unused_mut)]
+            let mut window_attributes = Window::default_attributes()
+                .with_title("Hello Triangle (wgpu + winit)");
+
+            // Only set an initial window size on desktop platforms.
+            // On mobile (iOS / Android), specifying an inner_size overrides UIKit's
+            // fullscreen window frame and forces a fixed desktop-like box (e.g. 800x600),
+            // which clips horizontally and leaves the bottom empty on a vertical phone.
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            {
+                window_attributes = window_attributes.with_inner_size(winit::dpi::LogicalSize::new(800.0, 600.0));
+            }
+
+            // On iOS, configure the native Retina scale factor (2x/3x)
+            #[cfg(target_os = "ios")]
+            {
+                use winit::platform::ios::WindowAttributesExtIOS;
+                let scale_factor = event_loop
+                    .primary_monitor()
+                    .map(|m| m.scale_factor())
+                    .unwrap_or(2.0);
+                window_attributes = window_attributes.with_scale_factor(scale_factor);
+            }
 
             let window = Arc::new(
                 event_loop
@@ -264,6 +370,10 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Resized(physical_size) => {
                 state.resize(physical_size);
+                state.window.request_redraw();
+            }
+            WindowEvent::ScaleFactorChanged { .. } => {
+                state.resize(state.window.inner_size());
                 state.window.request_redraw();
             }
             WindowEvent::RedrawRequested => {

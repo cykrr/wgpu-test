@@ -2276,6 +2276,7 @@ dependencies = [
 name = "wgpu_triangle"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "env_logger",
  "log",
  "pollster",
