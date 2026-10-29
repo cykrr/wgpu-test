@@ -1,24 +1,31 @@
-//! Cross-platform "Hello World" colored triangle in Rust using `winit` (v0.30+) and `wgpu`.
+//! Cross-platform "Hello World" 3D colored triangle in Rust using `winit` (v0.30+) and `wgpu`.
 //!
 //! Compatible with Windows, Linux, and iOS/macOS.
+//! Features true 3D rotation:
+//! - Horizontal swipe/drag rotates around the vertical Y axis (yaw).
+//! - Vertical swipe/drag rotates around the horizontal X axis (pitch).
+//! - Realistic 3D perspective projection and inertia momentum physics.
+//! - Double-sided rendering with shaded back-face.
 
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::time::Instant;
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, MouseButton, Touch, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
 
 /// WGSL shader source code.
 ///
-/// Draws an equilateral colored triangle indexed by `@builtin(vertex_index)`.
-/// An aspect-ratio scale uniform is applied to ensure the triangle maintains
-/// correct 1:1 geometry across both vertical (portrait phone) and horizontal (desktop/landscape) screens.
+/// Draws a centered equilateral colored triangle in 3D.
+/// Vertices are rotated around the X axis (pitch) and Y axis (yaw) before
+/// perspective projection and aspect-ratio scaling are applied.
 const SHADER_SOURCE: &str = r#"
 struct Uniforms {
     scale: vec2<f32>,
+    rotation: vec2<f32>, // (pitch: rotation around X, yaw: rotation around Y)
 };
 
 @group(0) @binding(0)
@@ -33,10 +40,11 @@ struct VertexOutput {
 fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
     var out: VertexOutput;
 
-    var pos = array<vec2<f32>, 3>(
-        vec2<f32>( 0.0,  0.25), // Top
-        vec2<f32>(-0.5, -0.5), // Bottom-left
-        vec2<f32>( 0.5, -0.5)  // Bottom-right
+    // Centered equilateral triangle with circumradius R = 0.5 in the XY plane
+    var pos = array<vec3<f32>, 3>(
+        vec3<f32>( 0.0,         0.5,   0.0), // Top
+        vec3<f32>(-0.4330127,  -0.25,  0.0), // Bottom-left
+        vec3<f32>( 0.4330127,  -0.25,  0.0)  // Bottom-right
     );
 
     var colors = array<vec3<f32>, 3>(
@@ -45,15 +53,48 @@ fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
         vec3<f32>(0.0, 0.0, 1.0)  // Blue
     );
 
-    // Apply aspect-ratio scale so triangle doesn't stretch or distort
-    out.clip_position = vec4<f32>(pos[in_vertex_index] * uniforms.scale, 0.0, 1.0);
+    let p = pos[in_vertex_index];
+    let pitch = uniforms.rotation.x; // Rotation around X axis (pitch / tilt up-down)
+    let yaw   = uniforms.rotation.y; // Rotation around Y axis (yaw / turn left-right)
+
+    // 1. Rotate around X axis (pitch)
+    let cx = cos(pitch);
+    let sx = sin(pitch);
+    let y1 = p.y * cx - p.z * sx;
+    let z1 = p.y * sx + p.z * cx;
+    let x1 = p.x;
+
+    // 2. Rotate around Y axis (yaw)
+    let cy = cos(yaw);
+    let sy = sin(yaw);
+    let x2 =  x1 * cy + z1 * sy;
+    let z2 = -x1 * sy + z1 * cy;
+    let y2 = y1;
+
+    // 3. Perspective projection
+    // Camera located at d = 2.0 along +Z looking toward origin
+    let d = 2.0;
+    let persp = d / (d - z2);
+    let proj_x = x2 * persp;
+    let proj_y = y2 * persp;
+
+    // Apply aspect-ratio scale so geometry is 1:1 on both portrait and landscape
+    out.clip_position = vec4<f32>(proj_x * uniforms.scale.x, proj_y * uniforms.scale.y, z2 * 0.5, 1.0);
     out.color = colors[in_vertex_index];
     return out;
 }
 
 @fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return vec4<f32>(in.color, 1.0);
+fn fs_main(
+    in: VertexOutput,
+    @builtin(front_facing) is_front: bool
+) -> @location(0) vec4<f32> {
+    var col = in.color;
+    // Shade the back-face slightly darker so the 3D flipping is clearly visible
+    if (!is_front) {
+        col = col * 0.45;
+    }
+    return vec4<f32>(col, 1.0);
 }
 "#;
 
@@ -82,6 +123,23 @@ pub struct RenderState {
     pipeline: wgpu::RenderPipeline,
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+
+    // 3D Rotation angles (radians) & velocities
+    pitch: f32,          // Rotation around X axis (tilt up / down)
+    yaw: f32,            // Rotation around Y axis (turn left / right)
+    velocity_pitch: f32, // Angular velocity around X
+    velocity_yaw: f32,   // Angular velocity around Y
+    last_frame_time: Instant,
+
+    // Touch interaction tracking (iOS / touch screens)
+    active_touch_id: Option<u64>,
+    last_touch_pos: Option<(f64, f64)>,
+    last_touch_time: Option<Instant>,
+
+    // Mouse interaction tracking (Desktop)
+    mouse_pressed: bool,
+    last_mouse_pos: Option<(f64, f64)>,
+    last_mouse_time: Option<Instant>,
 }
 
 impl RenderState {
@@ -137,17 +195,17 @@ impl RenderState {
         };
         surface.configure(&device, &config);
 
-        // Aspect ratio uniform buffer & bind group
+        // Aspect ratio & 3D rotation uniform buffer: [scale.x, scale.y, pitch, yaw]
         let scale = calculate_aspect_scale(width, height);
         let uniform_data: [f32; 4] = [scale[0], scale[1], 0.0, 0.0];
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Aspect Ratio Uniform Buffer"),
+            label: Some("3D Uniform Buffer"),
             contents: bytemuck::cast_slice(&uniform_data),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Aspect Ratio Bind Group Layout"),
+            label: Some("Uniform Bind Group Layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
                 visibility: wgpu::ShaderStages::VERTEX,
@@ -161,7 +219,7 @@ impl RenderState {
         });
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Aspect Ratio Bind Group"),
+            label: Some("Uniform Bind Group"),
             layout: &bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
@@ -170,18 +228,18 @@ impl RenderState {
         });
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Triangle Shader"),
+            label: Some("Triangle 3D Shader"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(SHADER_SOURCE)),
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Triangle Pipeline Layout"),
+            label: Some("Triangle 3D Pipeline Layout"),
             bind_group_layouts: &[&bind_group_layout],
             push_constant_ranges: &[],
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Triangle Render Pipeline"),
+            label: Some("Triangle 3D Render Pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -203,7 +261,7 @@ impl RenderState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
+                cull_mode: None, // Double-sided rendering so back of triangle is visible when rotated in 3D
                 polygon_mode: wgpu::PolygonMode::Fill,
                 unclipped_depth: false,
                 conservative: false,
@@ -227,6 +285,17 @@ impl RenderState {
             pipeline,
             uniform_buffer,
             bind_group,
+            pitch: 0.0,
+            yaw: 0.0,
+            velocity_pitch: 0.0,
+            velocity_yaw: 0.0,
+            last_frame_time: Instant::now(),
+            active_touch_id: None,
+            last_touch_pos: None,
+            last_touch_time: None,
+            mouse_pressed: false,
+            last_mouse_pos: None,
+            last_mouse_time: None,
         }
     }
 
@@ -236,12 +305,186 @@ impl RenderState {
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
 
-            // Update aspect ratio scale uniform
+            // Update aspect ratio scale uniform immediately
             let scale = calculate_aspect_scale(new_size.width, new_size.height);
-            let uniform_data: [f32; 4] = [scale[0], scale[1], 0.0, 0.0];
+            let uniform_data: [f32; 4] = [scale[0], scale[1], self.pitch, self.yaw];
             self.queue
                 .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&uniform_data));
         }
+    }
+
+    /// Advance physics simulation (inertia coasting with friction).
+    pub fn update(&mut self) {
+        let now = Instant::now();
+        let dt = (now - self.last_frame_time).as_secs_f32().min(0.1);
+        self.last_frame_time = now;
+
+        // Apply inertia physics when not actively dragging
+        if self.active_touch_id.is_none() && !self.mouse_pressed {
+            let decay = 0.94_f32.powf(dt * 60.0);
+
+            if self.velocity_yaw.abs() > 0.0001 {
+                self.yaw += self.velocity_yaw * dt;
+                self.velocity_yaw *= decay;
+                if self.velocity_yaw.abs() < 0.001 {
+                    self.velocity_yaw = 0.0;
+                }
+                self.yaw = self.yaw.rem_euclid(std::f32::consts::TAU);
+            }
+
+            if self.velocity_pitch.abs() > 0.0001 {
+                self.pitch += self.velocity_pitch * dt;
+                self.velocity_pitch *= decay;
+                if self.velocity_pitch.abs() < 0.001 {
+                    self.velocity_pitch = 0.0;
+                }
+                self.pitch = self.pitch.rem_euclid(std::f32::consts::TAU);
+            }
+        }
+    }
+
+    /// True if continuous redraws are required (actively dragging or coasting with momentum).
+    pub fn is_animating(&self) -> bool {
+        self.active_touch_id.is_some()
+            || self.mouse_pressed
+            || self.velocity_yaw.abs() > 0.001
+            || self.velocity_pitch.abs() > 0.001
+    }
+
+    pub fn handle_touch(&mut self, touch: Touch) {
+        let now = Instant::now();
+        match touch.phase {
+            TouchPhase::Started => {
+                if self.active_touch_id.is_none() {
+                    self.active_touch_id = Some(touch.id);
+                    self.last_touch_pos = Some((touch.location.x, touch.location.y));
+                    self.last_touch_time = Some(now);
+                    self.velocity_pitch = 0.0;
+                    self.velocity_yaw = 0.0;
+                }
+            }
+            TouchPhase::Moved => {
+                if self.active_touch_id == Some(touch.id) {
+                    if let Some(last_pos) = self.last_touch_pos {
+                        let dx = (touch.location.x - last_pos.0) as f32;
+                        let dy = (touch.location.y - last_pos.1) as f32;
+
+                        let width = self.config.width.max(1) as f32;
+                        let height = self.config.height.max(1) as f32;
+
+                        // Horizontal swipe rotates around vertical Y axis (yaw)
+                        let sensitivity_x = (std::f32::consts::PI * 2.5) / width;
+                        let delta_yaw = dx * sensitivity_x;
+                        self.yaw += delta_yaw;
+                        self.yaw = self.yaw.rem_euclid(std::f32::consts::TAU);
+
+                        // Vertical swipe rotates around horizontal X axis (pitch)
+                        let sensitivity_y = (std::f32::consts::PI * 2.5) / height;
+                        let delta_pitch = -dy * sensitivity_y;
+                        self.pitch += delta_pitch;
+                        self.pitch = self.pitch.rem_euclid(std::f32::consts::TAU);
+
+                        if let Some(last_time) = self.last_touch_time {
+                            let dt = now.duration_since(last_time).as_secs_f32();
+                            if dt > 0.0001 {
+                                let cur_vy = delta_yaw / dt;
+                                let cur_vx = delta_pitch / dt;
+                                self.velocity_yaw = self.velocity_yaw * 0.4 + cur_vy * 0.6;
+                                self.velocity_pitch = self.velocity_pitch * 0.4 + cur_vx * 0.6;
+
+                                let max_speed = 30.0;
+                                self.velocity_yaw = self.velocity_yaw.clamp(-max_speed, max_speed);
+                                self.velocity_pitch = self.velocity_pitch.clamp(-max_speed, max_speed);
+                            }
+                        }
+                    }
+                    self.last_touch_pos = Some((touch.location.x, touch.location.y));
+                    self.last_touch_time = Some(now);
+                }
+            }
+            TouchPhase::Ended => {
+                if self.active_touch_id == Some(touch.id) {
+                    if let Some(last_time) = self.last_touch_time {
+                        if now.duration_since(last_time) > std::time::Duration::from_millis(100) {
+                            self.velocity_yaw = 0.0;
+                            self.velocity_pitch = 0.0;
+                        }
+                    }
+                    self.active_touch_id = None;
+                    self.last_touch_pos = None;
+                    self.last_touch_time = None;
+                }
+            }
+            TouchPhase::Cancelled => {
+                if self.active_touch_id == Some(touch.id) {
+                    self.active_touch_id = None;
+                    self.last_touch_pos = None;
+                    self.last_touch_time = None;
+                    self.velocity_yaw = 0.0;
+                    self.velocity_pitch = 0.0;
+                }
+            }
+        }
+    }
+
+    pub fn handle_mouse_button(&mut self, state: ElementState) {
+        match state {
+            ElementState::Pressed => {
+                self.mouse_pressed = true;
+                self.velocity_yaw = 0.0;
+                self.velocity_pitch = 0.0;
+                self.last_mouse_time = Some(Instant::now());
+            }
+            ElementState::Released => {
+                self.mouse_pressed = false;
+                if let Some(last_time) = self.last_mouse_time {
+                    if Instant::now().duration_since(last_time) > std::time::Duration::from_millis(100) {
+                        self.velocity_yaw = 0.0;
+                        self.velocity_pitch = 0.0;
+                    }
+                }
+                self.last_mouse_time = None;
+            }
+        }
+    }
+
+    pub fn handle_cursor_moved(&mut self, position: winit::dpi::PhysicalPosition<f64>) {
+        let now = Instant::now();
+        if self.mouse_pressed {
+            if let Some(last_pos) = self.last_mouse_pos {
+                let dx = (position.x - last_pos.0) as f32;
+                let dy = (position.y - last_pos.1) as f32;
+
+                let width = self.config.width.max(1) as f32;
+                let height = self.config.height.max(1) as f32;
+
+                let sensitivity_x = (std::f32::consts::PI * 2.5) / width;
+                let delta_yaw = dx * sensitivity_x;
+                self.yaw += delta_yaw;
+                self.yaw = self.yaw.rem_euclid(std::f32::consts::TAU);
+
+                let sensitivity_y = (std::f32::consts::PI * 2.5) / height;
+                let delta_pitch = -dy * sensitivity_y;
+                self.pitch += delta_pitch;
+                self.pitch = self.pitch.rem_euclid(std::f32::consts::TAU);
+
+                if let Some(last_time) = self.last_mouse_time {
+                    let dt = now.duration_since(last_time).as_secs_f32();
+                    if dt > 0.0001 {
+                        let cur_vy = delta_yaw / dt;
+                        let cur_vx = delta_pitch / dt;
+                        self.velocity_yaw = self.velocity_yaw * 0.4 + cur_vy * 0.6;
+                        self.velocity_pitch = self.velocity_pitch * 0.4 + cur_vx * 0.6;
+
+                        let max_speed = 30.0;
+                        self.velocity_yaw = self.velocity_yaw.clamp(-max_speed, max_speed);
+                        self.velocity_pitch = self.velocity_pitch.clamp(-max_speed, max_speed);
+                    }
+                }
+            }
+            self.last_mouse_time = Some(now);
+        }
+        self.last_mouse_pos = Some((position.x, position.y));
     }
 
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -254,6 +497,12 @@ impl RenderState {
             self.resize(current_size);
         }
 
+        // Upload updated uniforms (scale + 3D rotation angles: pitch & yaw)
+        let scale = calculate_aspect_scale(self.config.width, self.config.height);
+        let uniform_data: [f32; 4] = [scale[0], scale[1], self.pitch, self.yaw];
+        self.queue
+            .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&uniform_data));
+
         let output = self.surface.get_current_texture()?;
         let view = output
             .texture
@@ -262,12 +511,12 @@ impl RenderState {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Triangle Command Encoder"),
+                label: Some("Triangle 3D Command Encoder"),
             });
 
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Triangle Render Pass"),
+                label: Some("Triangle 3D Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
@@ -308,7 +557,7 @@ impl ApplicationHandler for App {
         if self.state.is_none() {
             #[allow(unused_mut)]
             let mut window_attributes = Window::default_attributes()
-                .with_title("Hello Triangle (wgpu + winit)");
+                .with_title("Hello Triangle 3D (wgpu + winit)");
 
             // Only set an initial window size on desktop platforms.
             // On mobile (iOS / Android), specifying an inner_size overrides UIKit's
@@ -368,6 +617,22 @@ impl ApplicationHandler for App {
             } => {
                 event_loop.exit();
             }
+            WindowEvent::Touch(touch) => {
+                state.handle_touch(touch);
+                state.window.request_redraw();
+            }
+            WindowEvent::MouseInput {
+                state: element_state,
+                button: MouseButton::Left,
+                ..
+            } => {
+                state.handle_mouse_button(element_state);
+                state.window.request_redraw();
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                state.handle_cursor_moved(position);
+                state.window.request_redraw();
+            }
             WindowEvent::Resized(physical_size) => {
                 state.resize(physical_size);
                 state.window.request_redraw();
@@ -377,6 +642,7 @@ impl ApplicationHandler for App {
                 state.window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
+                state.update();
                 match state.render() {
                     Ok(_) => {}
                     Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
@@ -393,7 +659,9 @@ impl ApplicationHandler for App {
                         log::error!("Unspecified surface error.");
                     }
                 }
-                state.window.request_redraw();
+                if state.is_animating() {
+                    state.window.request_redraw();
+                }
             }
             _ => {}
         }
