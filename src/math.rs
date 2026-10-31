@@ -47,12 +47,17 @@ impl Quat {
         }
     }
 
-    /// Creates a quaternion from Euler pitch (rotation around X) and yaw (rotation around Y).
+    /// Creates a quaternion from Euler pitch (rotation around World X) and yaw (rotation around World Y):
+    /// q = q_pitch * q_yaw
+    ///
+    /// Applying yaw first (around World Up) and pitch second (around World/Screen Horizontal)
+    /// ensures vertical drags always tilt up/down relative to the screen/world, preventing
+    /// unwanted roll when looking at side faces (such as the -X face).
     #[inline]
     pub fn from_pitch_yaw(pitch: f32, yaw: f32) -> Self {
         let q_pitch = Self::from_axis_angle([1.0, 0.0, 0.0], pitch);
         let q_yaw = Self::from_axis_angle([0.0, 1.0, 0.0], yaw);
-        (q_yaw * q_pitch).normalize()
+        (q_pitch * q_yaw).normalize()
     }
 
     /// Default starting orientation: initial tilt (pitch 0.35 rad, yaw -0.45 rad).
@@ -115,11 +120,11 @@ impl Quat {
         ]
     }
 
-    /// Converts quaternion to Tait-Bryan pitch and yaw angles (radians).
+    /// Converts quaternion to Tait-Bryan pitch and yaw angles (radians) for q = q_pitch * q_yaw.
     pub fn to_pitch_yaw(&self) -> (f32, f32) {
-        let sin_p = (2.0 * (self.w * self.x - self.y * self.z)).clamp(-1.0, 1.0);
+        let sin_p = (2.0 * (self.w * self.x + self.y * self.z)).clamp(-1.0, 1.0);
         let pitch = sin_p.asin();
-        let sin_y = 2.0 * (self.w * self.y + self.x * self.z);
+        let sin_y = 2.0 * (self.w * self.y - self.x * self.z);
         let cos_y = 1.0 - 2.0 * (self.x * self.x + self.y * self.y);
         let yaw = sin_y.atan2(cos_y);
         (pitch, yaw)
@@ -295,16 +300,16 @@ mod tests {
         assert!((pitch - 0.35).abs() < 1e-5);
         assert!((yaw - (-0.45)).abs() < 1e-5);
 
-        // Compare vector rotation against Euler matrix rotation
+        // Compare vector rotation against Euler matrix rotation (yaw then pitch)
         let p = [0.28, -0.28, 0.28];
         let cx = 0.35_f32.cos();
         let sx = 0.35_f32.sin();
         let cy = (-0.45_f32).cos();
         let sy = (-0.45_f32).sin();
-        let y1 = p[1] * cx - p[2] * sx;
-        let z1 = p[1] * sx + p[2] * cx;
-        let x1 = p[0];
-        let expected = [x1 * cy + z1 * sy, y1, -x1 * sy + z1 * cy];
+        let x1 = p[0] * cy + p[2] * sy;
+        let y1 = p[1];
+        let z1 = -p[0] * sy + p[2] * cy;
+        let expected = [x1, y1 * cx - z1 * sx, y1 * sx + z1 * cx];
 
         let rotated = q_default.rotate_vec3(p);
         assert!((rotated[0] - expected[0]).abs() < 1e-6);
