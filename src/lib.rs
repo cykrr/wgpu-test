@@ -16,7 +16,7 @@ pub mod shader;
 
 pub use app::App;
 pub use controller::InteractionController;
-pub use math::{calculate_aspect_scale, Quat};
+pub use math::{calculate_aspect_scale, Quat, QuatExt};
 pub use renderer::RenderState;
 pub use shader::SHADER_SOURCE;
 

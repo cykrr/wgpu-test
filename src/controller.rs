@@ -3,7 +3,7 @@
 use std::time::{Duration, Instant};
 use winit::event::{ElementState, Touch, TouchPhase};
 
-use crate::math::Quat;
+use crate::math::{Quat, QuatExt};
 
 /// Default initial orientation angles (radians)
 pub const DEFAULT_PITCH: f32 = 0.35;
@@ -312,7 +312,7 @@ mod tests {
         // Dragging right (dx > 0, dy = 0) produces rotation around Y axis
         controller.drag(100.0, 0.0, 1000.0, 1000.0);
 
-        assert!((controller.orientation.norm() - 1.0).abs() < 1e-6);
+        assert!((controller.orientation.length() - 1.0).abs() < 1e-6);
         // Axis is [0, 1, 0], so y should be positive, x and z near zero
         assert!(controller.orientation.y > 0.0);
         assert!(controller.orientation.x.abs() < 1e-6);
@@ -326,7 +326,7 @@ mod tests {
         // Dragging down (dx = 0, dy > 0) produces rotation around X axis
         controller.drag(0.0, 100.0, 1000.0, 1000.0);
 
-        assert!((controller.orientation.norm() - 1.0).abs() < 1e-6);
+        assert!((controller.orientation.length() - 1.0).abs() < 1e-6);
         // Axis is [1, 0, 0], so x should be positive, y and z near zero
         assert!(controller.orientation.x > 0.0);
         assert!(controller.orientation.y.abs() < 1e-6);
@@ -339,7 +339,7 @@ mod tests {
 
         controller.drag(50.0, 50.0, 1000.0, 1000.0);
 
-        assert!((controller.orientation.norm() - 1.0).abs() < 1e-6);
+        assert!((controller.orientation.length() - 1.0).abs() < 1e-6);
         assert!(controller.orientation.x > 0.0);
         assert!(controller.orientation.y > 0.0);
     }
@@ -362,7 +362,7 @@ mod tests {
 
         // Orientation should have progressed
         assert_ne!(controller.orientation, q_before);
-        assert!((controller.orientation.norm() - 1.0).abs() < 1e-6);
+        assert!((controller.orientation.length() - 1.0).abs() < 1e-6);
 
         // Coasting for several seconds should decay velocity to zero
         for _ in 0..300 {
@@ -398,28 +398,30 @@ mod tests {
 
     #[test]
     fn test_side_face_vertical_drag_does_not_roll() {
+        use glam::Vec3;
+
         // Start with -X face (Pink face, initial normal [-1, 0, 0]) facing camera (+Z)
         let mut controller = InteractionController::from_pitch_yaw(0.0, std::f32::consts::FRAC_PI_2);
 
         // Verify -X face normal points toward camera (+Z)
-        let initial_normal = controller.orientation.rotate_vec3([-1.0, 0.0, 0.0]);
-        assert!(initial_normal[0].abs() < 1e-6);
-        assert!(initial_normal[1].abs() < 1e-6);
-        assert!((initial_normal[2] - 1.0).abs() < 1e-6);
+        let initial_normal = controller.orientation.mul_vec3(Vec3::new(-1.0, 0.0, 0.0));
+        assert!(initial_normal.x.abs() < 1e-6);
+        assert!(initial_normal.y.abs() < 1e-6);
+        assert!((initial_normal.z - 1.0).abs() < 1e-6);
 
         // Drag vertically (dy > 0, dy < 0)
         controller.drag(0.0, 50.0, 1000.0, 1000.0);
 
         // Top edge of pink face in local space: [-1.0, 1.0, 0.0]
-        let top_rotated = controller.orientation.rotate_vec3([-1.0, 1.0, 0.0]);
+        let top_rotated = controller.orientation.mul_vec3(Vec3::new(-1.0, 1.0, 0.0));
 
         // Screen horizontal (X) must stay exactly 0 (pure tilt, ZERO roll)
         assert!(
-            top_rotated[0].abs() < 1e-6,
+            top_rotated.x.abs() < 1e-6,
             "Screen X should stay 0 but was {}",
-            top_rotated[0]
+            top_rotated.x
         );
         // It tilted in Y and Z
-        assert!((top_rotated[1] - 1.0).abs() > 0.01);
+        assert!((top_rotated.y - 1.0).abs() > 0.01);
     }
 }
