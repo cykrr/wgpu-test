@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use winit::application::ApplicationHandler;
 use winit::event::{MouseButton, WindowEvent};
-use winit::event_loop::ActiveEventLoop;
+use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::window::{Window, WindowId};
 
 use crate::renderer::RenderState;
@@ -98,6 +98,9 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Touch(touch) => {
                 state.handle_touch(touch);
+                if state.is_animating() {
+                    event_loop.set_control_flow(ControlFlow::Poll);
+                }
                 state.window.request_redraw();
             }
             WindowEvent::MouseInput {
@@ -106,10 +109,16 @@ impl ApplicationHandler for App {
                 ..
             } => {
                 state.handle_mouse_button(element_state);
+                if state.is_animating() {
+                    event_loop.set_control_flow(ControlFlow::Poll);
+                }
                 state.window.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
                 state.handle_cursor_moved(position);
+                if state.is_animating() {
+                    event_loop.set_control_flow(ControlFlow::Poll);
+                }
                 state.window.request_redraw();
             }
             WindowEvent::Resized(physical_size) => {
@@ -139,10 +148,24 @@ impl ApplicationHandler for App {
                     }
                 }
                 if state.is_animating() {
+                    event_loop.set_control_flow(ControlFlow::Poll);
                     state.window.request_redraw();
+                } else {
+                    event_loop.set_control_flow(ControlFlow::Wait);
                 }
             }
             _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(state) = self.state.as_ref() {
+            if state.is_animating() {
+                event_loop.set_control_flow(ControlFlow::Poll);
+                state.window.request_redraw();
+            } else {
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
         }
     }
 }
