@@ -1,6 +1,7 @@
 struct Uniforms {
     scale: vec2<f32>,
-    rotation: vec2<f32>, // (pitch: rotation around X, yaw: rotation around Y)
+    _pad: vec2<f32>,      // 16-byte alignment padding for WGSL uniform buffers
+    rotation: vec4<f32>,  // Unit quaternion (x, y, z, w)
 };
 
 @group(0) @binding(0)
@@ -16,24 +17,9 @@ struct LineVertexOutput {
     @location(0) color: vec4<f32>,
 };
 
-// Rotates a 3D coordinate using pitch (around X) and yaw (around Y)
-fn rotate_model(p: vec3<f32>, pitch: f32, yaw: f32) -> vec3<f32> {
-    let cx = cos(pitch);
-    let sx = sin(pitch);
-    let cy = cos(yaw);
-    let sy = sin(yaw);
-
-    // 1. Rotate vertex position around X axis (pitch)
-    let y1 = p.y * cx - p.z * sx;
-    let z1 = p.y * sx + p.z * cx;
-    let x1 = p.x;
-
-    // 2. Rotate vertex position around Y axis (yaw)
-    let x2 =  x1 * cy + z1 * sy;
-    let z2 = -x1 * sy + z1 * cy;
-    let y2 = y1;
-
-    return vec3<f32>(x2, y2, z2);
+// Rotates a 3D coordinate using unit quaternion (Rodrigues formula)
+fn rotate_quat(p: vec3<f32>, q: vec4<f32>) -> vec3<f32> {
+    return p + 2.0 * cross(q.xyz, cross(q.xyz, p) + q.w * p);
 }
 
 // Projects a 3D camera-space coordinate onto screen clip-space
@@ -102,11 +88,8 @@ fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
     let normal = face_normals[face_index];
     let base_color = face_colors[face_index];
 
-    let pitch = uniforms.rotation.x;
-    let yaw   = uniforms.rotation.y;
-
-    let rotated_pos = rotate_model(p, pitch, yaw);
-    let rotated_normal = normalize(rotate_model(normal, pitch, yaw));
+    let rotated_pos = rotate_quat(p, uniforms.rotation);
+    let rotated_normal = normalize(rotate_quat(normal, uniforms.rotation));
 
     // Directional lighting from top-right-front
     let light_dir = normalize(vec3<f32>(0.35, 0.65, 0.75));
@@ -256,7 +239,7 @@ fn vs_lines(@builtin(vertex_index) in_vertex_index: u32) -> LineVertexOutput {
 
     var world_pos = pos;
     if (is_local) {
-        world_pos = rotate_model(pos, uniforms.rotation.x, uniforms.rotation.y);
+        world_pos = rotate_quat(pos, uniforms.rotation);
     }
 
     out.clip_position = project_vertex(world_pos, uniforms.scale);

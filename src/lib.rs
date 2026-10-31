@@ -2,10 +2,10 @@
 //!
 //! Compatible with Windows, Linux, and iOS/macOS.
 //! Features true 3D rotation:
-//! - Horizontal swipe/drag rotates around the vertical Y axis (yaw).
-//! - Vertical swipe/drag rotates around the horizontal X axis (pitch).
+//! - Virtual trackball (arcball) quaternion accumulator rotation.
+//! - 3D angular momentum coasting with exponential decay physics.
 //! - 6 vibrant colored faces with realistic directional lighting.
-//! - Perspective projection, backface culling, and inertia momentum physics.
+//! - Perspective projection, backface culling, and coordinate lines.
 //! - Built-in coordinate system reference lines (World grid, World axes, Local axes with arrowheads).
 
 pub mod app;
@@ -16,7 +16,7 @@ pub mod shader;
 
 pub use app::App;
 pub use controller::InteractionController;
-pub use math::calculate_aspect_scale;
+pub use math::{calculate_aspect_scale, Quat};
 pub use renderer::RenderState;
 pub use shader::SHADER_SOURCE;
 

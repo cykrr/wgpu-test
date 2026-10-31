@@ -1,22 +1,22 @@
-//! Touch and mouse interaction handling with 3D rotation physics and inertia.
+//! Touch and mouse interaction handling with 3D virtual trackball quaternion rotation and inertia.
 
 use std::time::{Duration, Instant};
 use winit::event::{ElementState, Touch, TouchPhase};
+
+use crate::math::Quat;
 
 /// Default initial orientation angles (radians)
 pub const DEFAULT_PITCH: f32 = 0.35;
 pub const DEFAULT_YAW: f32 = -0.45;
 
-/// Controls 3D orientation (pitch & yaw) via touch swipe and mouse drag interactions.
+/// Controls 3D orientation via virtual trackball (arcball) quaternion rotation.
 ///
-/// Supports inertia coasting with exponential decay physics.
+/// Supports 3D angular momentum coasting with exponential decay physics.
 #[derive(Debug)]
 pub struct InteractionController {
-    // 3D Rotation angles (radians) & velocities
-    pub pitch: f32,          // Rotation around X axis (tilt up / down)
-    pub yaw: f32,            // Rotation around Y axis (turn left / right)
-    pub velocity_pitch: f32, // Angular velocity around X
-    pub velocity_yaw: f32,   // Angular velocity around Y
+    // 3D Rotation quaternion & angular velocity vector (radians/sec)
+    pub orientation: Quat,
+    pub angular_velocity: [f32; 3],
     last_frame_time: Instant,
 
     // Touch interaction tracking (iOS / touch screens)
@@ -32,17 +32,15 @@ pub struct InteractionController {
 
 impl Default for InteractionController {
     fn default() -> Self {
-        Self::new(DEFAULT_PITCH, DEFAULT_YAW)
+        Self::new(Quat::default_orientation())
     }
 }
 
 impl InteractionController {
-    pub fn new(initial_pitch: f32, initial_yaw: f32) -> Self {
+    pub fn new(initial_orientation: Quat) -> Self {
         Self {
-            pitch: initial_pitch,
-            yaw: initial_yaw,
-            velocity_pitch: 0.0,
-            velocity_yaw: 0.0,
+            orientation: initial_orientation,
+            angular_velocity: [0.0, 0.0, 0.0],
             last_frame_time: Instant::now(),
             active_touch_id: None,
             last_touch_pos: None,
@@ -53,50 +51,139 @@ impl InteractionController {
         }
     }
 
-    /// Reset rotation orientation back to default starting angles and halt any momentum.
-    pub fn reset_orientation(&mut self) {
-        self.pitch = DEFAULT_PITCH;
-        self.yaw = DEFAULT_YAW;
-        self.velocity_pitch = 0.0;
-        self.velocity_yaw = 0.0;
+    pub fn from_pitch_yaw(initial_pitch: f32, initial_yaw: f32) -> Self {
+        Self::new(Quat::from_pitch_yaw(initial_pitch, initial_yaw))
     }
 
-    /// Advance physics simulation (inertia coasting with friction).
+    /// Reset rotation orientation back to default starting orientation and halt any momentum.
+    pub fn reset_orientation(&mut self) {
+        self.orientation = Quat::default_orientation();
+        self.angular_velocity = [0.0, 0.0, 0.0];
+    }
+
+    /// Pitch angle (rotation around X) in radians, derived from orientation quaternion.
+    #[inline]
+    pub fn pitch(&self) -> f32 {
+        self.orientation.to_pitch_yaw().0
+    }
+
+    /// Yaw angle (rotation around Y) in radians, derived from orientation quaternion.
+    #[inline]
+    pub fn yaw(&self) -> f32 {
+        self.orientation.to_pitch_yaw().1
+    }
+
+    /// Applies screen-space drag displacement in pixels:
+    /// u = normalize(dy, dx, 0.0)
+    /// theta = sqrt(dx^2 + dy^2) * sensitivity
+    /// delta_q = from_axis_angle(u, theta)
+    /// q <- normalize(delta_q * q)
+    pub fn apply_drag(
+        &mut self,
+        dx: f32,
+        dy: f32,
+        width: f32,
+        height: f32,
+        now: Instant,
+        last_time: Option<Instant>,
+    ) {
+        let dist = (dx * dx + dy * dy).sqrt();
+        if dist < 1e-6 {
+            return;
+        }
+
+        let min_dim = width.min(height).max(1.0);
+        let sensitivity = (std::f32::consts::PI * 2.5) / min_dim;
+
+        // Screen-space rotation axis: u = normalize(dy, dx, 0.0)
+        let u = [dy / dist, dx / dist, 0.0];
+        // Rotation angle: theta = sqrt(dx^2 + dy^2) * sensitivity
+        let theta = dist * sensitivity;
+        // Incremental rotation: delta_q = from_axis_angle(u, theta)
+        let delta_q = Quat::from_axis_angle(u, theta);
+        // Accumulate: q <- normalize(delta_q * q)
+        self.orientation = (delta_q * self.orientation).normalize();
+
+        // 3D Inertia Momentum Coasting
+        if let Some(prev_time) = last_time {
+            let dt = now.duration_since(prev_time).as_secs_f32();
+            if dt > 0.0001 {
+                // Instantaneous angular velocity: omega = u * (theta / dt)
+                let factor = theta / dt;
+                let inst_omega = [u[0] * factor, u[1] * factor, u[2] * factor];
+
+                // Smooth angular velocity vector
+                self.angular_velocity[0] = self.angular_velocity[0] * 0.4 + inst_omega[0] * 0.6;
+                self.angular_velocity[1] = self.angular_velocity[1] * 0.4 + inst_omega[1] * 0.6;
+                self.angular_velocity[2] = self.angular_velocity[2] * 0.4 + inst_omega[2] * 0.6;
+
+                // Clamp max speed
+                let speed = (self.angular_velocity[0] * self.angular_velocity[0]
+                    + self.angular_velocity[1] * self.angular_velocity[1]
+                    + self.angular_velocity[2] * self.angular_velocity[2])
+                    .sqrt();
+                let max_speed = 30.0;
+                if speed > max_speed {
+                    let scale = max_speed / speed;
+                    self.angular_velocity[0] *= scale;
+                    self.angular_velocity[1] *= scale;
+                    self.angular_velocity[2] *= scale;
+                }
+            }
+        }
+    }
+
+    /// Convenience method for applying drag without timing (for testing or scripted rotations).
+    pub fn drag(&mut self, dx: f32, dy: f32, width: f32, height: f32) {
+        let now = Instant::now();
+        self.apply_drag(dx, dy, width, height, now, None);
+    }
+
+    /// Advance physics simulation using elapsed wall-clock time.
     pub fn update(&mut self) {
         let now = Instant::now();
         let dt = (now - self.last_frame_time).as_secs_f32().min(0.1);
         self.last_frame_time = now;
+        self.update_with_dt(dt);
+    }
 
+    /// Advance physics simulation by explicit delta time (seconds).
+    pub fn update_with_dt(&mut self, dt: f32) {
         // Apply inertia physics when not actively dragging
         if self.active_touch_id.is_none() && !self.mouse_pressed {
-            let decay = 0.94_f32.powf(dt * 60.0);
+            let speed = (self.angular_velocity[0] * self.angular_velocity[0]
+                + self.angular_velocity[1] * self.angular_velocity[1]
+                + self.angular_velocity[2] * self.angular_velocity[2])
+                .sqrt();
 
-            if self.velocity_yaw.abs() > 0.0001 {
-                self.yaw += self.velocity_yaw * dt;
-                self.velocity_yaw *= decay;
-                if self.velocity_yaw.abs() < 0.001 {
-                    self.velocity_yaw = 0.0;
-                }
-                self.yaw = self.yaw.rem_euclid(std::f32::consts::TAU);
-            }
+            if speed > 0.0001 {
+                let decay = 0.94_f32.powf(dt * 60.0);
+                let angle = speed * dt;
+                let axis = [
+                    self.angular_velocity[0] / speed,
+                    self.angular_velocity[1] / speed,
+                    self.angular_velocity[2] / speed,
+                ];
+                let delta_q = Quat::from_axis_angle(axis, angle);
+                self.orientation = (delta_q * self.orientation).normalize();
 
-            if self.velocity_pitch.abs() > 0.0001 {
-                self.pitch += self.velocity_pitch * dt;
-                self.velocity_pitch *= decay;
-                if self.velocity_pitch.abs() < 0.001 {
-                    self.velocity_pitch = 0.0;
+                self.angular_velocity[0] *= decay;
+                self.angular_velocity[1] *= decay;
+                self.angular_velocity[2] *= decay;
+
+                if speed * decay < 0.001 {
+                    self.angular_velocity = [0.0, 0.0, 0.0];
                 }
-                self.pitch = self.pitch.rem_euclid(std::f32::consts::TAU);
             }
         }
     }
 
     /// True if continuous redraws are required (actively dragging or coasting with momentum).
     pub fn is_animating(&self) -> bool {
-        self.active_touch_id.is_some()
-            || self.mouse_pressed
-            || self.velocity_yaw.abs() > 0.001
-            || self.velocity_pitch.abs() > 0.001
+        let speed_sq = self.angular_velocity[0] * self.angular_velocity[0]
+            + self.angular_velocity[1] * self.angular_velocity[1]
+            + self.angular_velocity[2] * self.angular_velocity[2];
+        self.active_touch_id.is_some() || self.mouse_pressed || speed_sq > 0.001 * 0.001
     }
 
     pub fn handle_touch(&mut self, touch: Touch, width: f32, height: f32) {
@@ -110,8 +197,7 @@ impl InteractionController {
                     self.active_touch_id = Some(touch.id);
                     self.last_touch_pos = Some((touch.location.x, touch.location.y));
                     self.last_touch_time = Some(now);
-                    self.velocity_pitch = 0.0;
-                    self.velocity_yaw = 0.0;
+                    self.angular_velocity = [0.0, 0.0, 0.0];
                 }
             }
             TouchPhase::Moved => {
@@ -119,32 +205,7 @@ impl InteractionController {
                     if let Some(last_pos) = self.last_touch_pos {
                         let dx = (touch.location.x - last_pos.0) as f32;
                         let dy = (touch.location.y - last_pos.1) as f32;
-
-                        // Horizontal swipe rotates around vertical Y axis (yaw)
-                        let sensitivity_x = (std::f32::consts::PI * 2.5) / width;
-                        let delta_yaw = dx * sensitivity_x;
-                        self.yaw += delta_yaw;
-                        self.yaw = self.yaw.rem_euclid(std::f32::consts::TAU);
-
-                        // Vertical swipe rotates around horizontal X axis (pitch)
-                        let sensitivity_y = (std::f32::consts::PI * 2.5) / height;
-                        let delta_pitch = -dy * sensitivity_y;
-                        self.pitch += delta_pitch;
-                        self.pitch = self.pitch.rem_euclid(std::f32::consts::TAU);
-
-                        if let Some(last_time) = self.last_touch_time {
-                            let dt = now.duration_since(last_time).as_secs_f32();
-                            if dt > 0.0001 {
-                                let cur_vy = delta_yaw / dt;
-                                let cur_vx = delta_pitch / dt;
-                                self.velocity_yaw = self.velocity_yaw * 0.4 + cur_vy * 0.6;
-                                self.velocity_pitch = self.velocity_pitch * 0.4 + cur_vx * 0.6;
-
-                                let max_speed = 30.0;
-                                self.velocity_yaw = self.velocity_yaw.clamp(-max_speed, max_speed);
-                                self.velocity_pitch = self.velocity_pitch.clamp(-max_speed, max_speed);
-                            }
-                        }
+                        self.apply_drag(dx, dy, width, height, now, self.last_touch_time);
                     }
                     self.last_touch_pos = Some((touch.location.x, touch.location.y));
                     self.last_touch_time = Some(now);
@@ -154,8 +215,7 @@ impl InteractionController {
                 if self.active_touch_id == Some(touch.id) {
                     if let Some(last_time) = self.last_touch_time {
                         if now.duration_since(last_time) > Duration::from_millis(100) {
-                            self.velocity_yaw = 0.0;
-                            self.velocity_pitch = 0.0;
+                            self.angular_velocity = [0.0, 0.0, 0.0];
                         }
                     }
                     self.active_touch_id = None;
@@ -168,8 +228,7 @@ impl InteractionController {
                     self.active_touch_id = None;
                     self.last_touch_pos = None;
                     self.last_touch_time = None;
-                    self.velocity_yaw = 0.0;
-                    self.velocity_pitch = 0.0;
+                    self.angular_velocity = [0.0, 0.0, 0.0];
                 }
             }
         }
@@ -179,16 +238,14 @@ impl InteractionController {
         match state {
             ElementState::Pressed => {
                 self.mouse_pressed = true;
-                self.velocity_yaw = 0.0;
-                self.velocity_pitch = 0.0;
+                self.angular_velocity = [0.0, 0.0, 0.0];
                 self.last_mouse_time = Some(Instant::now());
             }
             ElementState::Released => {
                 self.mouse_pressed = false;
                 if let Some(last_time) = self.last_mouse_time {
                     if Instant::now().duration_since(last_time) > Duration::from_millis(100) {
-                        self.velocity_yaw = 0.0;
-                        self.velocity_pitch = 0.0;
+                        self.angular_velocity = [0.0, 0.0, 0.0];
                     }
                 }
                 self.last_mouse_time = None;
@@ -205,30 +262,7 @@ impl InteractionController {
             if let Some(last_pos) = self.last_mouse_pos {
                 let dx = (position.0 - last_pos.0) as f32;
                 let dy = (position.1 - last_pos.1) as f32;
-
-                let sensitivity_x = (std::f32::consts::PI * 2.5) / width;
-                let delta_yaw = dx * sensitivity_x;
-                self.yaw += delta_yaw;
-                self.yaw = self.yaw.rem_euclid(std::f32::consts::TAU);
-
-                let sensitivity_y = (std::f32::consts::PI * 2.5) / height;
-                let delta_pitch = -dy * sensitivity_y;
-                self.pitch += delta_pitch;
-                self.pitch = self.pitch.rem_euclid(std::f32::consts::TAU);
-
-                if let Some(last_time) = self.last_mouse_time {
-                    let dt = now.duration_since(last_time).as_secs_f32();
-                    if dt > 0.0001 {
-                        let cur_vy = delta_yaw / dt;
-                        let cur_vx = delta_pitch / dt;
-                        self.velocity_yaw = self.velocity_yaw * 0.4 + cur_vy * 0.6;
-                        self.velocity_pitch = self.velocity_pitch * 0.4 + cur_vx * 0.6;
-
-                        let max_speed = 30.0;
-                        self.velocity_yaw = self.velocity_yaw.clamp(-max_speed, max_speed);
-                        self.velocity_pitch = self.velocity_pitch.clamp(-max_speed, max_speed);
-                    }
-                }
+                self.apply_drag(dx, dy, width, height, now, self.last_mouse_time);
             }
             self.last_mouse_time = Some(now);
         }
@@ -243,23 +277,88 @@ mod tests {
     #[test]
     fn test_initial_state() {
         let controller = InteractionController::default();
-        assert_eq!(controller.pitch, DEFAULT_PITCH);
-        assert_eq!(controller.yaw, DEFAULT_YAW);
+        let expected = Quat::default_orientation();
+        assert_eq!(controller.orientation, expected);
+        assert_eq!(controller.angular_velocity, [0.0, 0.0, 0.0]);
         assert!(!controller.is_animating());
     }
 
     #[test]
     fn test_reset_orientation() {
-        let mut controller = InteractionController::default();
-        controller.pitch = 1.5;
-        controller.yaw = 2.0;
-        controller.velocity_pitch = 10.0;
-        controller.velocity_yaw = -5.0;
+        let mut controller = InteractionController::new(Quat::IDENTITY);
+        controller.angular_velocity = [5.0, -3.0, 1.0];
 
         controller.reset_orientation();
-        assert_eq!(controller.pitch, DEFAULT_PITCH);
-        assert_eq!(controller.yaw, DEFAULT_YAW);
-        assert_eq!(controller.velocity_pitch, 0.0);
-        assert_eq!(controller.velocity_yaw, 0.0);
+        assert_eq!(controller.orientation, Quat::default_orientation());
+        assert_eq!(controller.angular_velocity, [0.0, 0.0, 0.0]);
+        assert!(!controller.is_animating());
+    }
+
+    #[test]
+    fn test_drag_rotation_horizontal() {
+        let mut controller = InteractionController::new(Quat::IDENTITY);
+
+        // Dragging right (dx > 0, dy = 0) produces rotation around Y axis
+        controller.drag(100.0, 0.0, 1000.0, 1000.0);
+
+        assert!((controller.orientation.norm() - 1.0).abs() < 1e-6);
+        // Axis is [0, 1, 0], so y should be positive, x and z near zero
+        assert!(controller.orientation.y > 0.0);
+        assert!(controller.orientation.x.abs() < 1e-6);
+        assert!(controller.orientation.z.abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_drag_rotation_vertical() {
+        let mut controller = InteractionController::new(Quat::IDENTITY);
+
+        // Dragging down (dx = 0, dy > 0) produces rotation around X axis
+        controller.drag(0.0, 100.0, 1000.0, 1000.0);
+
+        assert!((controller.orientation.norm() - 1.0).abs() < 1e-6);
+        // Axis is [1, 0, 0], so x should be positive, y and z near zero
+        assert!(controller.orientation.x > 0.0);
+        assert!(controller.orientation.y.abs() < 1e-6);
+        assert!(controller.orientation.z.abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_drag_rotation_diagonal() {
+        let mut controller = InteractionController::new(Quat::IDENTITY);
+
+        controller.drag(50.0, 50.0, 1000.0, 1000.0);
+
+        assert!((controller.orientation.norm() - 1.0).abs() < 1e-6);
+        assert!(controller.orientation.x > 0.0);
+        assert!(controller.orientation.y > 0.0);
+    }
+
+    #[test]
+    fn test_inertia_momentum_coasting() {
+        let mut controller = InteractionController::new(Quat::IDENTITY);
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(16);
+
+        // Apply drag with timing to set angular velocity
+        controller.apply_drag(50.0, 0.0, 1000.0, 1000.0, t1, Some(t0));
+
+        assert!(controller.angular_velocity[1] > 0.0);
+        assert!(controller.is_animating());
+
+        let q_before = controller.orientation;
+        // Step forward in time by 16ms
+        controller.update_with_dt(0.016);
+
+        // Orientation should have progressed
+        assert_ne!(controller.orientation, q_before);
+        assert!((controller.orientation.norm() - 1.0).abs() < 1e-6);
+
+        // Coasting for several seconds should decay velocity to zero
+        for _ in 0..300 {
+            controller.update_with_dt(0.016);
+        }
+
+        assert_eq!(controller.angular_velocity, [0.0, 0.0, 0.0]);
+        assert!(!controller.is_animating());
     }
 }

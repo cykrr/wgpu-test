@@ -7,7 +7,7 @@ use winit::event::{ElementState, Touch};
 use winit::window::Window;
 
 use crate::controller::InteractionController;
-use crate::math::calculate_aspect_scale;
+use crate::math::{calculate_aspect_scale, Quat};
 use crate::shader::create_shader_module;
 
 /// Creates the uniform buffer bind group layout.
@@ -201,9 +201,10 @@ impl RenderState {
 
         let controller = InteractionController::default();
 
-        // Aspect ratio & 3D rotation uniform buffer: [scale.x, scale.y, pitch, yaw]
+        // Aspect ratio & 3D rotation uniform buffer: [scale.x, scale.y, 0.0, 0.0, q.x, q.y, q.z, q.w]
         let scale = calculate_aspect_scale(width, height);
-        let uniform_data: [f32; 4] = [scale[0], scale[1], controller.pitch, controller.yaw];
+        let q = controller.orientation;
+        let uniform_data: [f32; 8] = [scale[0], scale[1], 0.0, 0.0, q.x, q.y, q.z, q.w];
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Cube Uniform Buffer"),
             contents: bytemuck::cast_slice(&uniform_data),
@@ -246,13 +247,18 @@ impl RenderState {
     }
 
     #[inline]
+    pub fn orientation(&self) -> Quat {
+        self.controller.orientation
+    }
+
+    #[inline]
     pub fn pitch(&self) -> f32 {
-        self.controller.pitch
+        self.controller.pitch()
     }
 
     #[inline]
     pub fn yaw(&self) -> f32 {
-        self.controller.yaw
+        self.controller.yaw()
     }
 
     /// Reset rotation orientation back to default starting angle
@@ -268,12 +274,8 @@ impl RenderState {
 
             // Update aspect ratio scale uniform immediately
             let scale = calculate_aspect_scale(new_size.width, new_size.height);
-            let uniform_data: [f32; 4] = [
-                scale[0],
-                scale[1],
-                self.controller.pitch,
-                self.controller.yaw,
-            ];
+            let q = self.controller.orientation;
+            let uniform_data: [f32; 8] = [scale[0], scale[1], 0.0, 0.0, q.x, q.y, q.z, q.w];
             self.queue
                 .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&uniform_data));
         }
@@ -316,14 +318,10 @@ impl RenderState {
             self.resize(current_size);
         }
 
-        // Upload updated uniforms (scale + 3D rotation angles: pitch & yaw)
+        // Upload updated uniforms (scale + quaternion rotation: [scale.x, scale.y, 0.0, 0.0, q.x, q.y, q.z, q.w])
         let scale = calculate_aspect_scale(self.config.width, self.config.height);
-        let uniform_data: [f32; 4] = [
-            scale[0],
-            scale[1],
-            self.controller.pitch,
-            self.controller.yaw,
-        ];
+        let q = self.controller.orientation;
+        let uniform_data: [f32; 8] = [scale[0], scale[1], 0.0, 0.0, q.x, q.y, q.z, q.w];
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&uniform_data));
 
