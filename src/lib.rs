@@ -1,11 +1,11 @@
-//! Cross-platform "Hello World" 3D colored triangle in Rust using `winit` (v0.30+) and `wgpu`.
+//! Cross-platform 3D rotating cube in Rust using `winit` (v0.30+) and `wgpu`.
 //!
 //! Compatible with Windows, Linux, and iOS/macOS.
 //! Features true 3D rotation:
 //! - Horizontal swipe/drag rotates around the vertical Y axis (yaw).
 //! - Vertical swipe/drag rotates around the horizontal X axis (pitch).
-//! - Realistic 3D perspective projection and inertia momentum physics.
-//! - Double-sided rendering with shaded back-face.
+//! - 6 vibrant colored faces with realistic directional lighting.
+//! - Perspective projection, backface culling, and inertia momentum physics.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -19,8 +19,8 @@ use winit::window::{Window, WindowId};
 
 /// WGSL shader source code.
 ///
-/// Draws a centered equilateral colored triangle in 3D.
-/// Vertices are rotated around the X axis (pitch) and Y axis (yaw) before
+/// Draws a solid 3D cube with 6 distinct colored faces and directional lighting.
+/// Vertices and normals are transformed by pitch (X) and yaw (Y) rotations before
 /// perspective projection and aspect-ratio scaling are applied.
 const SHADER_SOURCE: &str = r#"
 struct Uniforms {
@@ -40,63 +40,108 @@ struct VertexOutput {
 fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
     var out: VertexOutput;
 
-    // Centered equilateral triangle with circumradius R = 0.42 in the XY plane
-    // Sized to ensure perspective projection never clips against screen bounds
-    var pos = array<vec3<f32>, 3>(
-        vec3<f32>( 0.0,         0.42,  0.0), // Top
-        vec3<f32>(-0.3637307,  -0.21,  0.0), // Bottom-left
-        vec3<f32>( 0.3637307,  -0.21,  0.0)  // Bottom-right
+    let h = 0.28;
+
+    // 8 cube corners
+    let p0 = vec3<f32>(-h, -h,  h); // 0: BL front
+    let p1 = vec3<f32>( h, -h,  h); // 1: BR front
+    let p2 = vec3<f32>( h,  h,  h); // 2: TR front
+    let p3 = vec3<f32>(-h,  h,  h); // 3: TL front
+    let p4 = vec3<f32>(-h, -h, -h); // 4: BL back
+    let p5 = vec3<f32>( h, -h, -h); // 5: BR back
+    let p6 = vec3<f32>( h,  h, -h); // 6: TR back
+    let p7 = vec3<f32>(-h,  h, -h); // 7: TL back
+
+    // 36 cube vertex positions (6 faces * 2 triangles * 3 vertices, CCW winding)
+    var pos = array<vec3<f32>, 36>(
+        // 1. Front face (+Z)
+        p0, p1, p2,  p0, p2, p3,
+        // 2. Back face (-Z)
+        p5, p4, p7,  p5, p7, p6,
+        // 3. Top face (+Y)
+        p3, p2, p6,  p3, p6, p7,
+        // 4. Bottom face (-Y)
+        p4, p5, p1,  p4, p1, p0,
+        // 5. Right face (+X)
+        p1, p5, p6,  p1, p6, p2,
+        // 6. Left face (-X)
+        p4, p0, p3,  p4, p3, p7,
     );
 
-    var colors = array<vec3<f32>, 3>(
-        vec3<f32>(1.0, 0.0, 0.0), // Red
-        vec3<f32>(0.0, 1.0, 0.0), // Green
-        vec3<f32>(0.0, 0.0, 1.0)  // Blue
+    // Outward face normals for directional lighting
+    var face_normals = array<vec3<f32>, 6>(
+        vec3<f32>( 0.0,  0.0,  1.0), // Front (+Z)
+        vec3<f32>( 0.0,  0.0, -1.0), // Back (-Z)
+        vec3<f32>( 0.0,  1.0,  0.0), // Top (+Y)
+        vec3<f32>( 0.0, -1.0,  0.0), // Bottom (-Y)
+        vec3<f32>( 1.0,  0.0,  0.0), // Right (+X)
+        vec3<f32>(-1.0,  0.0,  0.0), // Left (-X)
     );
 
+    // Distinct vibrant color for each face
+    var face_colors = array<vec3<f32>, 6>(
+        vec3<f32>(0.92, 0.25, 0.20), // Front: Coral Red
+        vec3<f32>(0.98, 0.52, 0.12), // Back: Sunset Orange
+        vec3<f32>(0.18, 0.82, 0.35), // Top: Emerald Green
+        vec3<f32>(0.12, 0.75, 0.85), // Bottom: Cyan / Teal
+        vec3<f32>(0.22, 0.45, 0.95), // Right: Royal Blue
+        vec3<f32>(0.78, 0.22, 0.88), // Left: Purple / Violet
+    );
+
+    let face_index = in_vertex_index / 6u;
     let p = pos[in_vertex_index];
+    let normal = face_normals[face_index];
+    let base_color = face_colors[face_index];
+
     let pitch = uniforms.rotation.x; // Rotation around X axis (pitch / tilt up-down)
     let yaw   = uniforms.rotation.y; // Rotation around Y axis (yaw / turn left-right)
 
-    // 1. Rotate around X axis (pitch)
     let cx = cos(pitch);
     let sx = sin(pitch);
+    let cy = cos(yaw);
+    let sy = sin(yaw);
+
+    // 1. Rotate vertex position around X axis (pitch)
     let y1 = p.y * cx - p.z * sx;
     let z1 = p.y * sx + p.z * cx;
     let x1 = p.x;
 
-    // 2. Rotate around Y axis (yaw)
-    let cy = cos(yaw);
-    let sy = sin(yaw);
+    // 2. Rotate vertex position around Y axis (yaw)
     let x2 =  x1 * cy + z1 * sy;
     let z2 = -x1 * sy + z1 * cy;
     let y2 = y1;
 
-    // 3. Perspective projection
+    // 3. Rotate normal vector
+    let ny1 = normal.y * cx - normal.z * sx;
+    let nz1 = normal.y * sx + normal.z * cx;
+    let nx1 = normal.x;
+    let nx2 =  nx1 * cy + nz1 * sy;
+    let nz2 = -nx1 * sy + nz1 * cy;
+    let ny2 = ny1;
+    let rotated_normal = normalize(vec3<f32>(nx2, ny2, nz2));
+
+    // Directional lighting from top-right-front
+    let light_dir = normalize(vec3<f32>(0.35, 0.65, 0.75));
+    let diffuse = max(dot(rotated_normal, light_dir), 0.0);
+    let ambient = 0.40;
+    let light_factor = ambient + diffuse * 0.60;
+
+    // 4. Perspective projection
     // Camera located at d = 2.5 along +Z looking toward origin
     let d = 2.5;
     let persp = d / (d - z2);
     let proj_x = x2 * persp;
     let proj_y = y2 * persp;
 
-    // Place z_clip at 0.5 (safely centered inside Metal/WebGPU [0.0, 1.0] depth volume)
-    // to prevent near/far plane clipping when rotated in 3D
+    // Apply aspect ratio scale and place safely in depth volume
     out.clip_position = vec4<f32>(proj_x * uniforms.scale.x, proj_y * uniforms.scale.y, 0.5, 1.0);
-    out.color = colors[in_vertex_index];
+    out.color = base_color * light_factor;
     return out;
 }
 
 @fragment
-fn fs_main(
-    in: VertexOutput,
-    @builtin(front_facing) is_front: bool
-) -> @location(0) vec4<f32> {
-    var col = in.color;
-    // Shade the back-face slightly darker so the 3D flipping is clearly visible
-    if (!is_front) {
-        col = col * 0.45;
-    }
-    return vec4<f32>(col, 1.0);
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    return vec4<f32>(in.color, 1.0);
 }
 "#;
 
@@ -197,11 +242,15 @@ impl RenderState {
         };
         surface.configure(&device, &config);
 
+        // Initial 3D tilt so multiple colored faces are immediately visible on startup
+        let initial_pitch: f32 = 0.35;
+        let initial_yaw: f32 = -0.45;
+
         // Aspect ratio & 3D rotation uniform buffer: [scale.x, scale.y, pitch, yaw]
         let scale = calculate_aspect_scale(width, height);
-        let uniform_data: [f32; 4] = [scale[0], scale[1], 0.0, 0.0];
+        let uniform_data: [f32; 4] = [scale[0], scale[1], initial_pitch, initial_yaw];
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("3D Uniform Buffer"),
+            label: Some("Cube Uniform Buffer"),
             contents: bytemuck::cast_slice(&uniform_data),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -230,18 +279,18 @@ impl RenderState {
         });
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Triangle 3D Shader"),
+            label: Some("Cube 3D Shader"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(SHADER_SOURCE)),
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Triangle 3D Pipeline Layout"),
+            label: Some("Cube 3D Pipeline Layout"),
             bind_group_layouts: &[&bind_group_layout],
             push_constant_ranges: &[],
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Triangle 3D Render Pipeline"),
+            label: Some("Cube 3D Render Pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -263,7 +312,7 @@ impl RenderState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None, // Double-sided rendering so back of triangle is visible when rotated in 3D
+                cull_mode: Some(wgpu::Face::Back), // Backface culling hides the 3 hidden back faces of the cube
                 polygon_mode: wgpu::PolygonMode::Fill,
                 unclipped_depth: false,
                 conservative: false,
@@ -287,8 +336,8 @@ impl RenderState {
             pipeline,
             uniform_buffer,
             bind_group,
-            pitch: 0.0,
-            yaw: 0.0,
+            pitch: initial_pitch,
+            yaw: initial_yaw,
             velocity_pitch: 0.0,
             velocity_yaw: 0.0,
             last_frame_time: Instant::now(),
@@ -513,12 +562,12 @@ impl RenderState {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Triangle 3D Command Encoder"),
+                label: Some("Cube 3D Command Encoder"),
             });
 
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Triangle 3D Render Pass"),
+                label: Some("Cube 3D Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
@@ -539,7 +588,8 @@ impl RenderState {
 
             render_pass.set_pipeline(&self.pipeline);
             render_pass.set_bind_group(0, &self.bind_group, &[]);
-            render_pass.draw(0..3, 0..1);
+            // 36 vertices: 6 faces * 2 triangles * 3 vertices
+            render_pass.draw(0..36, 0..1);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -559,7 +609,7 @@ impl ApplicationHandler for App {
         if self.state.is_none() {
             #[allow(unused_mut)]
             let mut window_attributes = Window::default_attributes()
-                .with_title("Hello Triangle 3D (wgpu + winit)");
+                .with_title("Hello Cube 3D (wgpu + winit)");
 
             // Only set an initial window size on desktop platforms.
             // On mobile (iOS / Android), specifying an inner_size overrides UIKit's
