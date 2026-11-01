@@ -1,6 +1,7 @@
 struct Uniforms {
     scale: vec2<f32>,
-    _pad: vec2<f32>,      // 16-byte alignment padding for WGSL uniform buffers
+    zoom: f32,
+    _pad: f32,            // 16-byte alignment padding for WGSL uniform buffers
     rotation: vec4<f32>,  // Unit quaternion (x, y, z, w)
 };
 
@@ -22,12 +23,12 @@ fn rotate_quat(p: vec3<f32>, q: vec4<f32>) -> vec3<f32> {
     return p + 2.0 * cross(q.xyz, cross(q.xyz, p) + q.w * p);
 }
 
-// Projects a 3D camera-space coordinate onto screen clip-space
-fn project_vertex(p: vec3<f32>, scale: vec2<f32>) -> vec4<f32> {
+// Projects a 3D camera-space coordinate onto screen clip-space with perspective and zoom
+fn project_vertex(p: vec3<f32>, scale: vec2<f32>, zoom: f32) -> vec4<f32> {
     let d = 2.5; // Camera distance along +Z
     let persp = d / (d - p.z);
-    let proj_x = p.x * persp;
-    let proj_y = p.y * persp;
+    let proj_x = p.x * persp * zoom;
+    let proj_y = p.y * persp * zoom;
     return vec4<f32>(proj_x * scale.x, proj_y * scale.y, 0.5, 1.0);
 }
 
@@ -97,7 +98,7 @@ fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
     let ambient = 0.40;
     let light_factor = ambient + diffuse * 0.60;
 
-    out.clip_position = project_vertex(rotated_pos, uniforms.scale);
+    out.clip_position = project_vertex(rotated_pos, uniforms.scale, uniforms.zoom);
     out.color = base_color * light_factor;
     return out;
 }
@@ -242,7 +243,7 @@ fn vs_lines(@builtin(vertex_index) in_vertex_index: u32) -> LineVertexOutput {
         world_pos = rotate_quat(pos, uniforms.rotation);
     }
 
-    out.clip_position = project_vertex(world_pos, uniforms.scale);
+    out.clip_position = project_vertex(world_pos, uniforms.scale, uniforms.zoom);
     out.color = color;
     return out;
 }

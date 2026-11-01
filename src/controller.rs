@@ -1,4 +1,5 @@
-//! Touch and mouse interaction handling with 3D virtual trackball quaternion rotation and inertia.
+//! Touch and mouse interaction handling with 3D virtual trackball quaternion rotation,
+//! pinch-to-zoom, and inertia physics.
 
 use std::time::{Duration, Instant};
 use winit::event::{ElementState, Touch, TouchPhase};
@@ -11,11 +12,29 @@ pub const DEFAULT_YAW: f32 = -0.45;
 pub const MAX_PITCH: f32 = std::f32::consts::FRAC_PI_2 - 0.02;
 pub const MIN_PITCH: f32 = -MAX_PITCH;
 
-/// Controls 3D orientation via orbit/turntable (zero roll) pitch and yaw quaternion rotation.
+/// Default zoom factor (1.0 = normal 100% scale)
+pub const DEFAULT_ZOOM: f32 = 1.0;
+/// Minimum allowed zoom factor (0.2x = wide field of view, zoomed far out)
+pub const MIN_ZOOM: f32 = 0.2;
+/// Maximum allowed zoom factor (5.0x = close-up inspection)
+pub const MAX_ZOOM: f32 = 5.0;
+
+/// Records an active finger contact on screen.
+#[derive(Clone, Copy, Debug)]
+struct TouchPoint {
+    id: u64,
+    x: f32,
+    y: f32,
+    time: Instant,
+}
+
+/// Controls 3D orientation via orbit/turntable (zero roll) pitch and yaw quaternion rotation
+/// and view magnification via pinch-to-zoom.
 ///
 /// Constrains orientation strictly to pitch and yaw, keeping the horizon level and preventing
 /// roll artifacts when tracing circular gestures. Supports angular momentum coasting with
 /// exponential decay physics.
+/// Multi-touch pinch directly magnifies/shrinks the view without erratic rotation.
 #[derive(Debug)]
 pub struct InteractionController {
     // 3D Rotation quaternion & angular velocity vector (radians/sec)
@@ -25,10 +44,12 @@ pub struct InteractionController {
     pub angular_velocity: [f32; 3],
     last_frame_time: Instant,
 
-    // Touch interaction tracking (iOS / touch screens)
-    active_touch_id: Option<u64>,
-    last_touch_pos: Option<(f64, f64)>,
-    last_touch_time: Option<Instant>,
+    // Zoom factor (1.0 = default scale)
+    pub zoom: f32,
+
+    // Multi-touch tracking (supports 1-finger orbit & 2-finger pinch-to-zoom)
+    touches: Vec<TouchPoint>,
+    last_pinch_dist: Option<f32>,
 
     // Mouse interaction tracking (Desktop)
     mouse_pressed: bool,
@@ -57,21 +78,24 @@ impl InteractionController {
             yaw,
             angular_velocity: [0.0, 0.0, 0.0],
             last_frame_time: Instant::now(),
-            active_touch_id: None,
-            last_touch_pos: None,
-            last_touch_time: None,
+            zoom: DEFAULT_ZOOM,
+            touches: Vec::new(),
+            last_pinch_dist: None,
             mouse_pressed: false,
             last_mouse_pos: None,
             last_mouse_time: None,
         }
     }
 
-    /// Reset rotation orientation back to default starting orientation and halt any momentum.
+    /// Reset rotation orientation and zoom back to default starting state and halt any momentum.
     pub fn reset_orientation(&mut self) {
         self.pitch = DEFAULT_PITCH;
         self.yaw = DEFAULT_YAW;
         self.orientation = Quat::default_orientation();
         self.angular_velocity = [0.0, 0.0, 0.0];
+        self.zoom = DEFAULT_ZOOM;
+        self.touches.clear();
+        self.last_pinch_dist = None;
     }
 
     /// Pitch angle (rotation around X) in radians.
@@ -84,6 +108,31 @@ impl InteractionController {
     #[inline]
     pub fn yaw(&self) -> f32 {
         self.yaw
+    }
+
+    /// Current zoom factor (1.0 = default scale).
+    #[inline]
+    pub fn zoom(&self) -> f32 {
+        self.zoom
+    }
+
+    /// Explicitly set the zoom magnification level, clamped between MIN_ZOOM and MAX_ZOOM.
+    pub fn set_zoom(&mut self, zoom: f32) {
+        if zoom.is_finite() && !zoom.is_nan() && zoom > 0.0 {
+            self.zoom = zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+        }
+    }
+
+    /// Multiplies the current zoom factor by `factor`, clamped between MIN_ZOOM and MAX_ZOOM.
+    pub fn apply_zoom_factor(&mut self, factor: f32) {
+        if factor.is_finite() && !factor.is_nan() && factor > 0.0 {
+            self.zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        }
+    }
+
+    /// Reset only zoom back to DEFAULT_ZOOM (1.0).
+    pub fn reset_zoom(&mut self) {
+        self.zoom = DEFAULT_ZOOM;
     }
 
     /// Applies screen-space drag displacement in pixels:
@@ -107,7 +156,8 @@ impl InteractionController {
         }
 
         let min_dim = width.min(height).max(1.0);
-        let sensitivity = (std::f32::consts::PI * 2.5) / min_dim;
+        // Scale sensitivity gently with zoom to ensure fine, stable control when zoomed in
+        let sensitivity = (std::f32::consts::PI * 2.5) / (min_dim * self.zoom.clamp(0.5, 3.0));
 
         let delta_pitch = dy * sensitivity;
         let delta_yaw = dx * sensitivity;
@@ -158,8 +208,8 @@ impl InteractionController {
 
     /// Advance physics simulation by explicit delta time (seconds).
     pub fn update_with_dt(&mut self, dt: f32) {
-        // Apply inertia physics when not actively dragging
-        if self.active_touch_id.is_none() && !self.mouse_pressed {
+        // Apply inertia physics when not actively dragging with fingers or mouse
+        if self.touches.is_empty() && !self.mouse_pressed {
             let speed = (self.angular_velocity[0] * self.angular_velocity[0]
                 + self.angular_velocity[1] * self.angular_velocity[1])
                 .sqrt();
@@ -189,60 +239,146 @@ impl InteractionController {
         }
     }
 
-    /// True if continuous redraws are required (actively dragging or coasting with momentum).
+    /// True if continuous redraws are required (actively dragging, pinching, or coasting with momentum).
     pub fn is_animating(&self) -> bool {
         let speed_sq = self.angular_velocity[0] * self.angular_velocity[0]
             + self.angular_velocity[1] * self.angular_velocity[1]
             + self.angular_velocity[2] * self.angular_velocity[2];
-        self.active_touch_id.is_some() || self.mouse_pressed || speed_sq > 0.001 * 0.001
+        !self.touches.is_empty() || self.mouse_pressed || speed_sq > 0.001 * 0.001
     }
 
+    /// Handles touch events: 1 finger drives turntable orbit rotation, 2 fingers drive pinch-to-zoom.
     pub fn handle_touch(&mut self, touch: Touch, width: f32, height: f32) {
         let now = Instant::now();
         let width = width.max(1.0);
         let height = height.max(1.0);
+        let x = touch.location.x as f32;
+        let y = touch.location.y as f32;
 
         match touch.phase {
             TouchPhase::Started => {
-                if self.active_touch_id.is_none() {
-                    self.active_touch_id = Some(touch.id);
-                    self.last_touch_pos = Some((touch.location.x, touch.location.y));
-                    self.last_touch_time = Some(now);
+                if let Some(t) = self.touches.iter_mut().find(|t| t.id == touch.id) {
+                    t.x = x;
+                    t.y = y;
+                    t.time = now;
+                } else {
+                    self.touches.push(TouchPoint {
+                        id: touch.id,
+                        x,
+                        y,
+                        time: now,
+                    });
+                }
+
+                if self.touches.len() == 1 {
+                    // 1 finger: initialize rotation anchor
                     self.angular_velocity = [0.0, 0.0, 0.0];
+                    self.last_pinch_dist = None;
+                } else if self.touches.len() >= 2 {
+                    // 2+ fingers: start pinch-to-zoom gesture
+                    // Clear angular velocity to prevent any accidental rotation spin
+                    self.angular_velocity = [0.0, 0.0, 0.0];
+                    let p0 = &self.touches[0];
+                    let p1 = &self.touches[1];
+                    let dist = ((p1.x - p0.x).powi(2) + (p1.y - p0.y).powi(2)).sqrt();
+                    self.last_pinch_dist = Some(dist);
                 }
             }
             TouchPhase::Moved => {
-                if self.active_touch_id == Some(touch.id) {
-                    if let Some(last_pos) = self.last_touch_pos {
-                        let dx = (touch.location.x - last_pos.0) as f32;
-                        let dy = (touch.location.y - last_pos.1) as f32;
-                        self.apply_drag(dx, dy, width, height, now, self.last_touch_time);
-                    }
-                    self.last_touch_pos = Some((touch.location.x, touch.location.y));
-                    self.last_touch_time = Some(now);
-                }
-            }
-            TouchPhase::Ended => {
-                if self.active_touch_id == Some(touch.id) {
-                    if let Some(last_time) = self.last_touch_time {
-                        if now.duration_since(last_time) > Duration::from_millis(100) {
-                            self.angular_velocity = [0.0, 0.0, 0.0];
+                if self.touches.len() == 1 {
+                    // Single-finger orbit drag
+                    if let Some(t) = self.touches.first_mut() {
+                        if t.id == touch.id {
+                            let dx = x - t.x;
+                            let dy = y - t.y;
+                            let last_time = t.time;
+                            t.x = x;
+                            t.y = y;
+                            t.time = now;
+                            self.apply_drag(dx, dy, width, height, now, Some(last_time));
                         }
                     }
-                    self.active_touch_id = None;
-                    self.last_touch_pos = None;
-                    self.last_touch_time = None;
-                }
-            }
-            TouchPhase::Cancelled => {
-                if self.active_touch_id == Some(touch.id) {
-                    self.active_touch_id = None;
-                    self.last_touch_pos = None;
-                    self.last_touch_time = None;
+                } else if self.touches.len() >= 2 {
+                    // Multi-touch pinch zoom
+                    if let Some(t) = self.touches.iter_mut().find(|t| t.id == touch.id) {
+                        t.x = x;
+                        t.y = y;
+                        t.time = now;
+                    }
+
+                    let p0 = &self.touches[0];
+                    let p1 = &self.touches[1];
+                    let dist = ((p1.x - p0.x).powi(2) + (p1.y - p0.y).powi(2)).sqrt();
+
+                    if let Some(prev_dist) = self.last_pinch_dist {
+                        if prev_dist > 1.0 && dist > 1.0 {
+                            let ratio = dist / prev_dist;
+                            self.apply_zoom_factor(ratio);
+                        }
+                    }
+                    self.last_pinch_dist = Some(dist);
                     self.angular_velocity = [0.0, 0.0, 0.0];
                 }
             }
+            TouchPhase::Ended => {
+                let was_single = self.touches.len() == 1 && self.touches[0].id == touch.id;
+                let last_time = self.touches.iter().find(|t| t.id == touch.id).map(|t| t.time);
+
+                self.touches.retain(|t| t.id != touch.id);
+                self.last_pinch_dist = None;
+
+                if was_single {
+                    if let Some(t_time) = last_time {
+                        if now.duration_since(t_time) > Duration::from_millis(100) {
+                            self.angular_velocity = [0.0, 0.0, 0.0];
+                        }
+                    }
+                } else {
+                    // Pinch ended or transitioning: clear any momentum and update anchor of remaining touch
+                    self.angular_velocity = [0.0, 0.0, 0.0];
+                    if let Some(remaining) = self.touches.first_mut() {
+                        remaining.time = now;
+                    }
+                }
+            }
+            TouchPhase::Cancelled => {
+                self.touches.retain(|t| t.id != touch.id);
+                self.last_pinch_dist = None;
+                self.angular_velocity = [0.0, 0.0, 0.0];
+                if let Some(remaining) = self.touches.first_mut() {
+                    remaining.time = now;
+                }
+            }
         }
+    }
+
+    /// Handles trackpad pinch gesture event (e.g. macOS trackpad or UIPinchGestureRecognizer).
+    /// Positive `delta` indicates magnification (zooming in), negative indicates shrinking (zooming out).
+    pub fn handle_pinch_gesture(&mut self, delta: f64, phase: TouchPhase) {
+        if !delta.is_finite() || delta.is_nan() {
+            return;
+        }
+        match phase {
+            TouchPhase::Started => {
+                self.angular_velocity = [0.0, 0.0, 0.0];
+            }
+            TouchPhase::Moved => {
+                let factor = (1.0 + delta as f32).max(0.01);
+                self.apply_zoom_factor(factor);
+            }
+            TouchPhase::Ended | TouchPhase::Cancelled => {
+                self.angular_velocity = [0.0, 0.0, 0.0];
+            }
+        }
+    }
+
+    /// Handles mouse scroll wheel or trackpad two-finger scroll zoom.
+    pub fn handle_mouse_wheel(&mut self, delta: &winit::event::MouseScrollDelta) {
+        let factor = match delta {
+            winit::event::MouseScrollDelta::LineDelta(_x, y) => 1.0 + (*y * 0.1),
+            winit::event::MouseScrollDelta::PixelDelta(pos) => 1.0 + (pos.y as f32 * 0.002),
+        };
+        self.apply_zoom_factor(factor);
     }
 
     pub fn handle_mouse_button(&mut self, state: ElementState) {
@@ -423,5 +559,132 @@ mod tests {
         );
         // It tilted in Y and Z
         assert!((top_rotated.y - 1.0).abs() > 0.01);
+    }
+
+    fn make_touch(id: u64, phase: TouchPhase, x: f64, y: f64) -> Touch {
+        Touch {
+            device_id: winit::event::DeviceId::dummy(),
+            phase,
+            location: winit::dpi::PhysicalPosition::new(x, y),
+            force: None,
+            id,
+        }
+    }
+
+    #[test]
+    fn test_pinch_to_zoom_multi_touch() {
+        let mut controller = InteractionController::default();
+        assert_eq!(controller.zoom(), DEFAULT_ZOOM);
+
+        // Put finger 1 down at (100, 100)
+        controller.handle_touch(make_touch(0, TouchPhase::Started, 100.0, 100.0), 800.0, 600.0);
+        assert_eq!(controller.zoom(), 1.0);
+
+        // Put finger 2 down at (200, 100) -> initial distance = 100.0 px
+        controller.handle_touch(make_touch(1, TouchPhase::Started, 200.0, 100.0), 800.0, 600.0);
+        assert_eq!(controller.zoom(), 1.0);
+
+        // Spread fingers: finger 2 moves to (300, 100) -> new distance = 200.0 px (2x zoom)
+        controller.handle_touch(make_touch(1, TouchPhase::Moved, 300.0, 100.0), 800.0, 600.0);
+        assert!((controller.zoom() - 2.0).abs() < 1e-4);
+
+        // Pinch fingers together: finger 2 moves to (150, 100) -> new distance = 50.0 px (0.5x from initial, 0.25x from 2x = 0.5)
+        controller.handle_touch(make_touch(1, TouchPhase::Moved, 150.0, 100.0), 800.0, 600.0);
+        assert!((controller.zoom() - 0.5).abs() < 1e-4);
+
+        // Finger 2 lifts
+        controller.handle_touch(make_touch(1, TouchPhase::Ended, 150.0, 100.0), 800.0, 600.0);
+        // Finger 1 lifts
+        controller.handle_touch(make_touch(0, TouchPhase::Ended, 100.0, 100.0), 800.0, 600.0);
+        // Zoom is preserved after releasing fingers
+        assert!((controller.zoom() - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_pinch_zoom_clamping() {
+        let mut controller = InteractionController::default();
+
+        // Test clamping to MAX_ZOOM
+        controller.apply_zoom_factor(100.0);
+        assert_eq!(controller.zoom(), MAX_ZOOM);
+
+        // Test clamping to MIN_ZOOM
+        controller.apply_zoom_factor(0.001);
+        assert_eq!(controller.zoom(), MIN_ZOOM);
+
+        // Reset restores DEFAULT_ZOOM
+        controller.reset_zoom();
+        assert_eq!(controller.zoom(), DEFAULT_ZOOM);
+    }
+
+    #[test]
+    fn test_pinch_preserves_orientation_and_stops_spin() {
+        let mut controller = InteractionController::default();
+        let initial_orientation = controller.orientation;
+        controller.angular_velocity = [10.0, -5.0, 0.0];
+
+        // Put finger 1 down
+        controller.handle_touch(make_touch(0, TouchPhase::Started, 100.0, 100.0), 800.0, 600.0);
+        assert_eq!(controller.angular_velocity, [0.0, 0.0, 0.0]);
+
+        // Put finger 2 down
+        controller.handle_touch(make_touch(1, TouchPhase::Started, 200.0, 100.0), 800.0, 600.0);
+        // Angular velocity must remain zero during pinch
+        assert_eq!(controller.angular_velocity, [0.0, 0.0, 0.0]);
+
+        // Move finger 2 to pinch
+        controller.handle_touch(make_touch(1, TouchPhase::Moved, 250.0, 100.0), 800.0, 600.0);
+        // Orientation should NOT have changed during pinch
+        assert_eq!(controller.orientation, initial_orientation);
+        assert_eq!(controller.angular_velocity, [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn test_transition_from_pinch_to_single_touch() {
+        let mut controller = InteractionController::default();
+        let q_start = controller.orientation;
+
+        // Start 2-finger pinch
+        controller.handle_touch(make_touch(0, TouchPhase::Started, 100.0, 100.0), 800.0, 600.0);
+        controller.handle_touch(make_touch(1, TouchPhase::Started, 200.0, 100.0), 800.0, 600.0);
+        controller.handle_touch(make_touch(1, TouchPhase::Moved, 240.0, 100.0), 800.0, 600.0);
+
+        // Lift finger 1; finger 0 remains
+        controller.handle_touch(make_touch(1, TouchPhase::Ended, 240.0, 100.0), 800.0, 600.0);
+
+        // Now move finger 0 slightly: it should drag smoothly without jumping
+        controller.handle_touch(make_touch(0, TouchPhase::Moved, 110.0, 100.0), 800.0, 600.0);
+        assert_ne!(controller.orientation, q_start);
+        assert!((controller.orientation.length() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_trackpad_pinch_gesture() {
+        let mut controller = InteractionController::default();
+
+        // Magnify by 20%
+        controller.handle_pinch_gesture(0.2, TouchPhase::Moved);
+        assert!((controller.zoom() - 1.2).abs() < 1e-5);
+
+        // Shrink by 10%
+        controller.handle_pinch_gesture(-0.1, TouchPhase::Moved);
+        assert!((controller.zoom() - 1.08).abs() < 1e-4);
+
+        // Non-finite delta is ignored safely
+        controller.handle_pinch_gesture(f64::NAN, TouchPhase::Moved);
+        assert!((controller.zoom() - 1.08).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_mouse_wheel_zoom() {
+        let mut controller = InteractionController::default();
+
+        // Line delta (scroll wheel up)
+        controller.handle_mouse_wheel(&winit::event::MouseScrollDelta::LineDelta(0.0, 1.0));
+        assert!((controller.zoom() - 1.1).abs() < 1e-5);
+
+        // Line delta (scroll wheel down)
+        controller.handle_mouse_wheel(&winit::event::MouseScrollDelta::LineDelta(0.0, -1.0));
+        assert!((controller.zoom() - 0.99).abs() < 1e-4);
     }
 }

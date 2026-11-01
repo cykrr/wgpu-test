@@ -93,8 +93,27 @@ impl ApplicationHandler for App {
                         state.reset_orientation();
                         state.window.request_redraw();
                     }
+                    winit::keyboard::Key::Character("+") | winit::keyboard::Key::Character("=") => {
+                        state.apply_zoom_factor(1.1);
+                        state.window.request_redraw();
+                    }
+                    winit::keyboard::Key::Character("-") | winit::keyboard::Key::Character("_") => {
+                        state.apply_zoom_factor(0.9);
+                        state.window.request_redraw();
+                    }
                     _ => {}
                 }
+            }
+            WindowEvent::PinchGesture { delta, phase, .. } => {
+                state.handle_pinch_gesture(delta, phase);
+                if state.is_animating() {
+                    event_loop.set_control_flow(ControlFlow::Poll);
+                }
+                state.window.request_redraw();
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                state.handle_mouse_wheel(&delta);
+                state.window.request_redraw();
             }
             WindowEvent::Touch(touch) => {
                 state.handle_touch(touch);

@@ -201,10 +201,19 @@ impl RenderState {
 
         let controller = InteractionController::default();
 
-        // Aspect ratio & 3D rotation uniform buffer: [scale.x, scale.y, 0.0, 0.0, q.x, q.y, q.z, q.w]
+        // Aspect ratio, zoom & 3D rotation uniform buffer: [scale.x, scale.y, zoom, 0.0, q.x, q.y, q.z, q.w]
         let scale = calculate_aspect_scale(width, height);
         let q = controller.orientation;
-        let uniform_data: [f32; 8] = [scale[0], scale[1], 0.0, 0.0, q.x, q.y, q.z, q.w];
+        let uniform_data: [f32; 8] = [
+            scale[0],
+            scale[1],
+            controller.zoom(),
+            0.0,
+            q.x,
+            q.y,
+            q.z,
+            q.w,
+        ];
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Cube Uniform Buffer"),
             contents: bytemuck::cast_slice(&uniform_data),
@@ -261,7 +270,25 @@ impl RenderState {
         self.controller.yaw()
     }
 
-    /// Reset rotation orientation back to default starting angle
+    /// Current zoom magnification factor.
+    #[inline]
+    pub fn zoom(&self) -> f32 {
+        self.controller.zoom()
+    }
+
+    /// Sets the zoom magnification level directly.
+    #[inline]
+    pub fn set_zoom(&mut self, zoom: f32) {
+        self.controller.set_zoom(zoom);
+    }
+
+    /// Multiplies the current zoom factor by `factor`.
+    #[inline]
+    pub fn apply_zoom_factor(&mut self, factor: f32) {
+        self.controller.apply_zoom_factor(factor);
+    }
+
+    /// Reset rotation orientation and zoom back to default starting values.
     pub fn reset_orientation(&mut self) {
         self.controller.reset_orientation();
     }
@@ -275,7 +302,16 @@ impl RenderState {
             // Update aspect ratio scale uniform immediately
             let scale = calculate_aspect_scale(new_size.width, new_size.height);
             let q = self.controller.orientation;
-            let uniform_data: [f32; 8] = [scale[0], scale[1], 0.0, 0.0, q.x, q.y, q.z, q.w];
+            let uniform_data: [f32; 8] = [
+                scale[0],
+                scale[1],
+                self.controller.zoom(),
+                0.0,
+                q.x,
+                q.y,
+                q.z,
+                q.w,
+            ];
             self.queue
                 .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&uniform_data));
         }
@@ -294,6 +330,14 @@ impl RenderState {
     pub fn handle_touch(&mut self, touch: Touch) {
         self.controller
             .handle_touch(touch, self.config.width as f32, self.config.height as f32);
+    }
+
+    pub fn handle_pinch_gesture(&mut self, delta: f64, phase: winit::event::TouchPhase) {
+        self.controller.handle_pinch_gesture(delta, phase);
+    }
+
+    pub fn handle_mouse_wheel(&mut self, delta: &winit::event::MouseScrollDelta) {
+        self.controller.handle_mouse_wheel(delta);
     }
 
     pub fn handle_mouse_button(&mut self, state: ElementState) {
@@ -318,10 +362,19 @@ impl RenderState {
             self.resize(current_size);
         }
 
-        // Upload updated uniforms (scale + quaternion rotation: [scale.x, scale.y, 0.0, 0.0, q.x, q.y, q.z, q.w])
+        // Upload updated uniforms (scale + zoom + quaternion rotation: [scale.x, scale.y, zoom, 0.0, q.x, q.y, q.z, q.w])
         let scale = calculate_aspect_scale(self.config.width, self.config.height);
         let q = self.controller.orientation;
-        let uniform_data: [f32; 8] = [scale[0], scale[1], 0.0, 0.0, q.x, q.y, q.z, q.w];
+        let uniform_data: [f32; 8] = [
+            scale[0],
+            scale[1],
+            self.controller.zoom(),
+            0.0,
+            q.x,
+            q.y,
+            q.z,
+            q.w,
+        ];
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&uniform_data));
 

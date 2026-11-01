@@ -3,6 +3,7 @@
 //! Compatible with Windows, Linux, and iOS/macOS.
 //! Features true 3D rotation:
 //! - Virtual trackball (arcball) quaternion accumulator rotation.
+//! - Pinch-to-zoom multi-touch and trackpad magnification.
 //! - 3D angular momentum coasting with exponential decay physics.
 //! - 6 vibrant colored faces with realistic directional lighting.
 //! - Perspective projection, backface culling, and coordinate lines.
@@ -15,7 +16,9 @@ pub mod renderer;
 pub mod shader;
 
 pub use app::App;
-pub use controller::InteractionController;
+pub use controller::{
+    InteractionController, DEFAULT_PITCH, DEFAULT_YAW, DEFAULT_ZOOM, MAX_ZOOM, MIN_ZOOM,
+};
 pub use math::{calculate_aspect_scale, Quat, QuatExt};
 pub use renderer::RenderState;
 pub use shader::SHADER_SOURCE;
